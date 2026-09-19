@@ -1,4 +1,0 @@
-com/interview/kvstore/recovery/RecoveryHardeningTest.class
-com/interview/kvstore/wal/WalWriterReaderTest.class
-com/interview/kvstore/recovery/RecoveryTest.class
-com/interview/kvstore/core/StorageEngineTest.class
