@@ -37,7 +37,7 @@ class ApiControllerTest {
     }
 
     @Test
-    void putGetAndDeleteViaController() {
+    void putGetAndDeleteViaController() throws Exception {
         // PUT
         ResponseEntity<?> putRes = kvController.put("item1", Map.of("value", "phone"));
         assertEquals(HttpStatus.OK, putRes.getStatusCode());
@@ -60,7 +60,7 @@ class ApiControllerTest {
     }
 
     @Test
-    void batchWriteAndPrefixQueryViaController() {
+    void batchWriteAndPrefixQueryViaController() throws Exception {
         KeyValueController.BatchRequest req = new KeyValueController.BatchRequest(
                 Map.of("user:101", "Alice", "user:102", "Bob", "config:theme", "dark"),
                 List.of()

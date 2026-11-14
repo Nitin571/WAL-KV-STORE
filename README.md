@@ -167,7 +167,7 @@ This mounts a persistent Docker volume at `/data/wal` so data survives container
 | :--- | :--- | :--- |
 | `SERVER_PORT` | `8080` | HTTP listening port |
 | `WAL_FILE` | `/data/wal/store.wal` | Path to the active `.wal` file |
-| `WAL_AUTO_COMPACT_THRESHOLD_BYTES` | `52428800` (50MB) | File size threshold for auto-compaction |
+| `WAL_AUTO_COMPACT_THRESHOLD_BYTES` | `10485760` (10MB) | File size threshold for auto-compaction |
 
 ---
 

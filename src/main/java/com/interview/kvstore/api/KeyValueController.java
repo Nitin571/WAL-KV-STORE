@@ -13,11 +13,15 @@ import java.util.Map;
 
 /**
  * Production REST API over StorageEngine. Exposes full CRUD, range scans,
- * prefix queries, and atomic batch writes.
+ * prefix queries, and atomic batch writes with strict input validation.
  */
 @RestController
 @RequestMapping("/keys")
 public class KeyValueController {
+
+    public static final int MAX_KEY_LENGTH = 1024;
+    public static final int MAX_VALUE_LENGTH = 8 * 1024 * 1024; // 8 MiB
+    public static final int MAX_BATCH_SIZE = 1000;
 
     private final StorageEngine engine;
 
@@ -26,21 +30,28 @@ public class KeyValueController {
     }
 
     @PutMapping(value = "/{key}", consumes = "application/json")
-    public ResponseEntity<?> put(@PathVariable String key, @RequestBody Map<String, String> body) {
+    public ResponseEntity<?> put(
+            @PathVariable("key") String key,
+            @RequestBody Map<String, String> body) throws StorageException {
+        validateKey(key);
+        if (body == null || !body.containsKey("value")) {
+            throw new IllegalArgumentException("Request body must include \"value\"");
+        }
         String value = body.get("value");
         if (value == null) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Request body must include \"value\""));
+            throw new IllegalArgumentException("Value cannot be null");
         }
-        try {
-            engine.put(key, value); // returns only after the write is fsynced to disk
-            return ResponseEntity.ok(Map.of("key", key, "value", value, "status", "durably written"));
-        } catch (StorageException e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        if (value.length() > MAX_VALUE_LENGTH) {
+            throw new IllegalArgumentException("Value length exceeds maximum allowed limit of " + MAX_VALUE_LENGTH + " characters");
         }
+
+        engine.put(key, value); // returns only after write is fsynced to disk
+        return ResponseEntity.ok(Map.of("key", key, "value", value, "status", "durably written"));
     }
 
     @GetMapping("/{key}")
-    public ResponseEntity<?> get(@PathVariable String key) {
+    public ResponseEntity<?> get(@PathVariable("key") String key) {
+        validateKey(key);
         String value = engine.get(key);
         if (value == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "key not found"));
@@ -49,13 +60,10 @@ public class KeyValueController {
     }
 
     @DeleteMapping("/{key}")
-    public ResponseEntity<?> delete(@PathVariable String key) {
-        try {
-            engine.delete(key);
-            return ResponseEntity.ok(Map.of("key", key, "status", "durably deleted"));
-        } catch (StorageException e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
-        }
+    public ResponseEntity<?> delete(@PathVariable("key") String key) throws StorageException {
+        validateKey(key);
+        engine.delete(key);
+        return ResponseEntity.ok(Map.of("key", key, "status", "durably deleted"));
     }
 
     /**
@@ -67,10 +75,18 @@ public class KeyValueController {
      */
     @GetMapping
     public ResponseEntity<?> query(
-            @RequestParam(required = false) String prefix,
-            @RequestParam(required = false) String from,
-            @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "100") int limit) {
+            @RequestParam(value = "prefix", required = false) String prefix,
+            @RequestParam(value = "from", required = false) String from,
+            @RequestParam(value = "to", required = false) String to,
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+
+        if (limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("Limit must be between 1 and 1000 (was " + limit + ")");
+        }
+
+        if (from != null && to != null && from.compareTo(to) > 0) {
+            throw new IllegalArgumentException("Invalid range: 'from' key (" + from + ") cannot be greater than 'to' key (" + to + ")");
+        }
 
         if (prefix != null) {
             Map<String, String> matches = engine.scan(prefix, limit);
@@ -89,31 +105,53 @@ public class KeyValueController {
      * Executes an atomic batch of puts and deletes with a single fsync.
      */
     @PostMapping(value = "/batch", consumes = "application/json")
-    public ResponseEntity<?> batchWrite(@RequestBody BatchRequest request) {
+    public ResponseEntity<?> batchWrite(@RequestBody BatchRequest request) throws StorageException {
+        if (request == null) {
+            throw new IllegalArgumentException("Batch request body cannot be null");
+        }
+
         List<BatchOp> ops = new ArrayList<>();
         if (request.puts() != null) {
             for (Map.Entry<String, String> entry : request.puts().entrySet()) {
-                ops.add(BatchOp.put(entry.getKey(), entry.getValue()));
+                String k = entry.getKey();
+                String v = entry.getValue();
+                validateKey(k);
+                if (v == null) {
+                    throw new IllegalArgumentException("Batch PUT value cannot be null for key: " + k);
+                }
+                if (v.length() > MAX_VALUE_LENGTH) {
+                    throw new IllegalArgumentException("Batch PUT value exceeds max length for key: " + k);
+                }
+                ops.add(BatchOp.put(k, v));
             }
         }
         if (request.deletes() != null) {
             for (String key : request.deletes()) {
+                validateKey(key);
                 ops.add(BatchOp.delete(key));
             }
         }
 
         if (ops.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Batch request contains no operations"));
+            throw new IllegalArgumentException("Batch request contains no operations");
+        }
+        if (ops.size() > MAX_BATCH_SIZE) {
+            throw new IllegalArgumentException("Batch size exceeds maximum limit of " + MAX_BATCH_SIZE + " operations");
         }
 
-        try {
-            engine.batchWrite(ops);
-            return ResponseEntity.ok(Map.of(
-                    "status", "durably written",
-                    "operationCount", ops.size()
-            ));
-        } catch (StorageException e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        engine.batchWrite(ops);
+        return ResponseEntity.ok(Map.of(
+                "status", "durably written",
+                "operationCount", ops.size()
+        ));
+    }
+
+    private void validateKey(String key) {
+        if (key == null || key.isBlank()) {
+            throw new IllegalArgumentException("Key cannot be null or blank");
+        }
+        if (key.length() > MAX_KEY_LENGTH) {
+            throw new IllegalArgumentException("Key length exceeds maximum allowed limit of " + MAX_KEY_LENGTH + " characters");
         }
     }
 
