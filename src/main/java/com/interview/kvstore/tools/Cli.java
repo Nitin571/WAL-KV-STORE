@@ -104,6 +104,9 @@ public final class Cli {
                             System.out.println("  WAL file size:          " + s.walFileSizeBytes() + " bytes");
                             System.out.println("  Current sequence num:   " + s.currentSequenceNumber());
                             System.out.println("  Startup recovered keys: " + s.recoveredEntriesCount());
+                            System.out.println("  Total write operations: " + s.totalWriteOps());
+                            System.out.println("  Avg write latency (µs): " + s.avgWriteLatencyMicros());
+                            System.out.println("  Compaction count:       " + s.compactionCount());
                         }
                         case "size" -> System.out.println(engine.size() + " keys currently in store");
                         case "exit", "quit" -> { System.out.println("Bye."); return; }

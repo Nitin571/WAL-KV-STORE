@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -39,6 +40,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class StorageEngine implements AutoCloseable {
 
     public static final long DEFAULT_AUTO_COMPACT_THRESHOLD_BYTES = 10 * 1024 * 1024L; // 10 MB
+    private static final System.Logger LOG = System.getLogger(StorageEngine.class.getName());
 
     public record EngineStats(
             int keyCount,
@@ -46,7 +48,10 @@ public final class StorageEngine implements AutoCloseable {
             long lastCompactedAt,
             long recoveredEntriesCount,
             boolean tornWriteDetected,
-            long currentSequenceNumber
+            long currentSequenceNumber,
+            long totalWriteOps,
+            double avgWriteLatencyMicros,
+            long compactionCount
     ) {}
 
     private final ConcurrentSkipListMap<String, String> data = new ConcurrentSkipListMap<>();
@@ -54,6 +59,10 @@ public final class StorageEngine implements AutoCloseable {
     private final long autoCompactThresholdBytes;
     private final RecoveryResult lastRecovery;
     private final ReentrantLock writeLock = new ReentrantLock();
+
+    private final AtomicLong totalWriteOps = new AtomicLong();
+    private final AtomicLong totalWriteNanos = new AtomicLong();
+    private final AtomicLong totalCompactionOps = new AtomicLong();
 
     private final FileChannel lockChannel;
     private final FileLock fileLock;
@@ -119,6 +128,9 @@ public final class StorageEngine implements AutoCloseable {
         } catch (IOException e) {
             throw new StorageException("Failed to open WAL for writing: " + walFile, e);
         }
+
+        LOG.log(System.Logger.Level.INFO, "StorageEngine initialized with WAL {0}. Recovered {1} entries (torn write detected: {2})",
+                walFile, lastRecovery.recoveredEntries.size(), lastRecovery.tornWriteFound);
     }
 
     /** Exposes what happened during startup recovery, e.g. for logging or a health-check endpoint. */
@@ -134,10 +146,13 @@ public final class StorageEngine implements AutoCloseable {
     }
 
     public void put(String key, String value) throws StorageException {
+        long startNanos = System.nanoTime();
         writeLock.lock();
         try {
             WalEntry entry = writer.appendPut(key, value); // durable the moment this returns
             applyToMemory(entry); // still inside the lock -- memory order now matches WAL order
+            totalWriteOps.incrementAndGet();
+            totalWriteNanos.addAndGet(System.nanoTime() - startNanos);
             checkAutoCompact();
         } catch (IOException e) {
             throw new StorageException("Failed to durably write key: " + key, e);
@@ -147,10 +162,13 @@ public final class StorageEngine implements AutoCloseable {
     }
 
     public void delete(String key) throws StorageException {
+        long startNanos = System.nanoTime();
         writeLock.lock();
         try {
             WalEntry entry = writer.appendDelete(key);
             applyToMemory(entry);
+            totalWriteOps.incrementAndGet();
+            totalWriteNanos.addAndGet(System.nanoTime() - startNanos);
             checkAutoCompact();
         } catch (IOException e) {
             throw new StorageException("Failed to durably delete key: " + key, e);
@@ -164,12 +182,15 @@ public final class StorageEngine implements AutoCloseable {
      */
     public void batchWrite(List<BatchOp> ops) throws StorageException {
         if (ops == null || ops.isEmpty()) return;
+        long startNanos = System.nanoTime();
         writeLock.lock();
         try {
             List<WalEntry> entries = writer.appendBatch(ops);
             for (WalEntry entry : entries) {
                 applyToMemory(entry);
             }
+            totalWriteOps.addAndGet(ops.size());
+            totalWriteNanos.addAndGet(System.nanoTime() - startNanos);
             checkAutoCompact();
         } catch (IOException e) {
             throw new StorageException("Failed to durably write batch of " + ops.size() + " operations", e);
@@ -286,8 +307,11 @@ public final class StorageEngine implements AutoCloseable {
             // Step 5: Reopen writer on the clean compacted file
             this.writer = new WalWriter(walFile, seq);
             this.lastCompactedAt = System.currentTimeMillis();
+            totalCompactionOps.incrementAndGet();
 
             long sizeAfter = Files.exists(walFile) ? Files.size(walFile) : 0;
+            LOG.log(System.Logger.Level.INFO, "WAL compacted successfully: {0} bytes -> {1} bytes ({2} bytes reclaimed, {3} keys retained)",
+                    sizeBefore, sizeAfter, (sizeBefore - sizeAfter), data.size());
             return new CompactionResult(sizeBefore, sizeAfter, data.size());
         } catch (IOException e) {
             // Harden compaction failure recovery: if anything fails after writer is closed,
@@ -305,7 +329,7 @@ public final class StorageEngine implements AutoCloseable {
                     this.writer = new WalWriter(walFile, data.size());
                 }
             } catch (Exception restoreEx) {
-                System.err.println("Fatal: Unable to restore WalWriter following compaction failure: " + restoreEx.getMessage());
+                LOG.log(System.Logger.Level.ERROR, "Fatal: Unable to restore WalWriter following compaction failure: {0}", restoreEx.getMessage());
             }
 
             throw new StorageException("Failed to compact WAL file: " + walFile, e);
@@ -332,7 +356,7 @@ public final class StorageEngine implements AutoCloseable {
                 compact();
             }
         } catch (Exception e) {
-            System.err.println("Warning: Auto-compaction failed: " + e.getMessage());
+            LOG.log(System.Logger.Level.WARNING, "Warning: Auto-compaction failed: {0}", e.getMessage());
         }
     }
 
@@ -353,13 +377,19 @@ public final class StorageEngine implements AutoCloseable {
             }
         } catch (IOException ignored) {}
 
+        long ops = totalWriteOps.get();
+        double avgLatencyMicros = ops == 0 ? 0.0 : (totalWriteNanos.get() / (double) ops) / 1000.0;
+
         return new EngineStats(
                 data.size(),
                 walSize,
                 lastCompactedAt,
                 lastRecovery != null ? lastRecovery.recoveredEntries.size() : 0,
                 lastRecovery != null && lastRecovery.tornWriteFound,
-                writer != null ? writer.currentSequence() : 0
+                writer != null ? writer.currentSequence() : 0,
+                ops,
+                Math.round(avgLatencyMicros * 10.0) / 10.0,
+                totalCompactionOps.get()
         );
     }
 

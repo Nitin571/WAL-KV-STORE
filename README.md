@@ -112,8 +112,11 @@ curl -X POST http://localhost:8080/keys/batch \
 ```
 
 ### Administrative Endpoints
-* **Health Check:** `GET /admin/health`
-* **Telemetry & Metrics:** `GET /admin/stats`
+* **Health Check (Public):** `GET /admin/health` (no authentication required; used by Docker/Kubernetes readiness and liveness probes)
+* **Telemetry & Metrics (Protected):** `GET /admin/stats` (requires `X-Admin-Token` or `Authorization: Bearer <token>`)
+  ```bash
+  curl -H "X-Admin-Token: secret-admin-token" http://localhost:8080/admin/stats
+  ```
   ```json
   {
     "keyCount": 1500,
@@ -121,10 +124,16 @@ curl -X POST http://localhost:8080/keys/batch \
     "lastCompactedAt": 1726058000,
     "recoveredEntriesCount": 1500,
     "tornWriteDetectedOnStartup": false,
-    "currentSequenceNumber": 1500
+    "currentSequenceNumber": 1500,
+    "totalWriteOps": 3200,
+    "avgWriteLatencyMicros": 412.5,
+    "compactionCount": 3
   }
   ```
-* **Trigger Compaction:** `POST /admin/compact`
+* **Trigger Compaction (Protected):** `POST /admin/compact` (requires `X-Admin-Token` or `Authorization: Bearer <token>`)
+  ```bash
+  curl -X POST -H "Authorization: Bearer secret-admin-token" http://localhost:8080/admin/compact
+  ```
   ```json
   {
     "status": "compacted",
@@ -172,21 +181,24 @@ This mounts a persistent Docker volume at `/data/wal` so data survives container
 | `SERVER_PORT` | `8080` | HTTP listening port |
 | `WAL_FILE` | `/data/wal/store.wal` | Path to the active `.wal` file |
 | `WAL_AUTO_COMPACT_THRESHOLD_BYTES` | `10485760` (10MB) | File size threshold for auto-compaction |
+| `KVSTORE_ADMIN_TOKEN` | `secret-admin-token` | Secret key required for `/admin/stats` and `/admin/compact` |
 
 ---
 
 ## Test Suite
 
-All 28 comprehensive unit tests pass with zero warnings:
+All 40 comprehensive unit and integration tests pass with zero warnings:
 
 ```bash
 mvn test
 ```
 
+* `KeyValueControllerHttpIntegrationTest` (9 Spring MVC HTTP integration tests: routing, param binding, input validation, 400/401/404 handling)
+* `StorageEngineHardeningTest` (Exclusive file locking, dual-process conflict detection, dynamic health check verification)
 * `StorageEngineTest` (CRUD, persistence across reboots)
 * `CompactionTest` (Space reclamation, atomic file replacement, auto-compaction)
 * `BatchAndScanTest` (Group commit batching, prefix searches, range scans)
 * `RecoveryTest` (Clean log replay, torn-write repair, truncation forcing)
 * `RecoveryHardeningTest` (Pre-allocation size rejection, corruption detection, sequence integrity)
-* `WalWriterReaderTest` (Binary layout, Unicode support, empty string vs null preservation)
-* `ApiControllerTest` (REST API verification)
+* `WalWriterReaderTest` (Binary layout, Unicode support, empty string vs null preservation, pre-write entry size bounds)
+* `ApiControllerTest` (REST API controller verification)

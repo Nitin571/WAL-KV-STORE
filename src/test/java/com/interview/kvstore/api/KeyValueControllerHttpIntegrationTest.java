@@ -159,19 +159,41 @@ class KeyValueControllerHttpIntegrationTest {
 
     @Test
     void testAdminEndpoints() throws Exception {
-        // Health check
+        // 1. Health check is public (no authentication required)
         mockMvc.perform(get("/admin/health"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("UP"));
+                .andExpect(jsonPath("$.status").value("UP"))
+                .andExpect(jsonPath("$.walWritable").value(true));
 
-        // Telemetry stats
+        // 2. Telemetry stats without token should return 401 Unauthorized
         mockMvc.perform(get("/admin/stats"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error", containsString("Unauthorized")));
+
+        // 3. Compaction without token should return 401 Unauthorized
+        mockMvc.perform(post("/admin/compact"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error", containsString("Unauthorized")));
+
+        // 4. Calling with invalid token should return 401 Unauthorized
+        mockMvc.perform(get("/admin/stats")
+                        .header("X-Admin-Token", "wrong-secret"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error", containsString("Unauthorized")));
+
+        // 5. Telemetry stats with valid X-Admin-Token header
+        mockMvc.perform(get("/admin/stats")
+                        .header("X-Admin-Token", "secret-admin-token"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.keyCount").isNumber())
-                .andExpect(jsonPath("$.walFileSizeBytes").isNumber());
+                .andExpect(jsonPath("$.walFileSizeBytes").isNumber())
+                .andExpect(jsonPath("$.totalWriteOps").isNumber())
+                .andExpect(jsonPath("$.avgWriteLatencyMicros").isNumber())
+                .andExpect(jsonPath("$.compactionCount").isNumber());
 
-        // Compaction
-        mockMvc.perform(post("/admin/compact"))
+        // 6. Compaction with valid Authorization: Bearer header
+        mockMvc.perform(post("/admin/compact")
+                        .header("Authorization", "Bearer secret-admin-token"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("compacted"))
                 .andExpect(jsonPath("$.keysRetained").isNumber());
