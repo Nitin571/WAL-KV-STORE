@@ -4,3 +4,7 @@ out/
 target/
 *.class
 wal-data/*.wal
+.DS_Store
+**/.DS_Store
+*.tmp
+

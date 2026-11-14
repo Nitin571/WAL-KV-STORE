@@ -47,6 +47,42 @@ public final class WalWriter implements AutoCloseable {
         return entry;
     }
 
+    /**
+     * Appends an entire batch of operations to the WAL and performs a SINGLE
+     * fsync (force) across all of them. This provides group commit semantics:
+     * writing 1,000 items in a batch incurs the disk sync latency of 1 write,
+     * rather than 1,000 separate disk syncs.
+     */
+    public synchronized java.util.List<WalEntry> appendBatch(java.util.List<BatchOp> ops) throws IOException {
+        if (ops == null || ops.isEmpty()) {
+            return java.util.List.of();
+        }
+        java.util.List<WalEntry> entries = new java.util.ArrayList<>(ops.size());
+        java.util.List<byte[]> byteArrays = new java.util.ArrayList<>(ops.size());
+        int totalBytes = 0;
+
+        for (BatchOp op : ops) {
+            WalEntry entry = new WalEntry(nextSeq.getAndIncrement(), op.opType(), op.key(), op.value());
+            byte[] bytes = entry.serialize();
+            entries.add(entry);
+            byteArrays.add(bytes);
+            totalBytes += bytes.length;
+        }
+
+        ByteBuffer combined = ByteBuffer.allocate(totalBytes);
+        for (byte[] bytes : byteArrays) {
+            combined.put(bytes);
+        }
+        combined.flip();
+
+        while (combined.hasRemaining()) {
+            channel.write(combined);
+        }
+        channel.force(true);
+
+        return entries;
+    }
+
     private void writeAndForce(WalEntry entry) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(entry.serialize());
         while (buf.hasRemaining()) {

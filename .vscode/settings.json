@@ -1,0 +1,10 @@
+{
+    "java.jdt.ls.java.home": "/opt/homebrew/opt/openjdk",
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "maven.terminal.customEnv": [
+        {
+            "environmentVariable": "JAVA_HOME",
+            "value": "/opt/homebrew/opt/openjdk"
+        }
+    ]
+}

@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Spring Boot - WalKvApplication",
+            "request": "launch",
+            "mainClass": "com.interview.kvstore.WalKvApplication",
+            "projectName": "kvstore",
+            "env": {
+                "SERVER_PORT": "8080",
+                "WAL_FILE": "./wal-data/store.wal"
+            }
+        },
+        {
+            "type": "java",
+            "name": "Interactive CLI Shell",
+            "request": "launch",
+            "mainClass": "com.interview.kvstore.tools.Cli",
+            "projectName": "kvstore",
+            "args": ["wal-data/store.wal"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

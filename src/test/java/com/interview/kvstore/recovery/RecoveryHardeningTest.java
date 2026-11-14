@@ -149,4 +149,27 @@ class RecoveryHardeningTest {
         assertEquals(1, result.recoveredEntries.size());
         assertEquals(cleanSize, Files.size(walFile), "torn write case should still truncate as before");
     }
+
+    @Test
+    void negativeLengthPrefixIsTreatedAsCorruptionNotTornWrite() throws Exception {
+        // A negative length prefix (sign bit set by a bit-flip) is structurally
+        // impossible from a normal append. It must be treated as corruption so
+        // recovery doesn't silently truncate valid data that may follow.
+        try (WalWriter writer = new WalWriter(walFile, 0)) {
+            writer.appendPut("goodkey", "committed");
+        }
+
+        try (FileChannel ch = FileChannel.open(walFile, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+            ByteBuffer negative = ByteBuffer.allocate(8);
+            negative.putInt(-42);  // negative length -- impossible from normal writes
+            negative.putInt(0);    // filler so file has some bytes
+            negative.flip();
+            ch.write(negative);
+            ch.force(true);
+        }
+
+        StorageException ex = assertThrows(StorageException.class, () -> RecoveryManager.recover(walFile));
+        assertTrue(ex.getMessage().toLowerCase().contains("corrupt"),
+                "expected message to indicate corruption, was: " + ex.getMessage());
+    }
 }

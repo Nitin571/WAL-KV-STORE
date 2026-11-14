@@ -79,7 +79,14 @@ public final class WalReader implements AutoCloseable {
         // it. A negative or absurdly large value is treated as corrupt,
         // not as "let's try to allocate that much and see what happens."
         if (bodyPlusChecksumLen <= 0) {
-            throw new TornWriteException(recordStart);
+            // A zero or negative length is structurally impossible from a
+            // normal append: WalWriter always writes a positive body+checksum
+            // length. A negative value (high bit set) is a bit-flip or
+            // corruption, not a crash artifact -- surface it as corruption so
+            // recovery doesn't silently truncate valid data that may follow.
+            throw new CorruptedEntryException(recordStart,
+                    "declared entry size " + bodyPlusChecksumLen + " is zero or negative -- " +
+                    "this is not a plausible crash artifact and indicates corruption");
         }
         if (bodyPlusChecksumLen > MAX_ENTRY_SIZE_BYTES) {
             throw new CorruptedEntryException(recordStart,
@@ -164,6 +171,10 @@ public final class WalReader implements AutoCloseable {
                 byte[] valBytes = new byte[valLen];
                 buf.get(valBytes);
                 value = new String(valBytes, StandardCharsets.UTF_8);
+            } else if (op == WalEntry.OpType.PUT) {
+                // A PUT with valLen == 0 is a valid empty-string value, not
+                // null. Only DELETE entries have a genuinely null value.
+                value = "";
             }
 
             if (buf.remaining() != 0) {

@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  wal-kv-store:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wal-kv-store
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_PORT=8080
+      - WAL_FILE=/data/wal/store.wal
+      - WAL_AUTO_COMPACT_THRESHOLD_BYTES=10485760 # 10 MB auto-compaction
+    volumes:
+      - wal-data:/data/wal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/admin/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  wal-data:
+    driver: local

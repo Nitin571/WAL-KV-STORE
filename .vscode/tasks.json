@@ -1,0 +1,22 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Spring Boot: Run",
+            "type": "shell",
+            "command": "mvn spring-boot:run",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Maven: Run All Tests",
+            "type": "shell",
+            "command": "mvn test",
+            "group": "test",
+            "problemMatcher": []
+        }
+    ]
+}

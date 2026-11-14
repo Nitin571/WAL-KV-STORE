@@ -25,7 +25,16 @@ public final class Cli {
         long pid = ProcessHandle.current().pid();
         System.out.println("WAL-backed KV store. PID = " + pid +
                 " (kill -9 " + pid + " from another terminal to test crash recovery live).");
-        System.out.println("Commands: put <key> <value> | get <key> | delete <key> | size | exit");
+        System.out.println("Commands:");
+        System.out.println("  put <key> <value>            - Durably write a key-value pair");
+        System.out.println("  get <key>                    - Read a key value");
+        System.out.println("  delete <key>                 - Durably delete a key");
+        System.out.println("  scan <prefix> [limit]        - Prefix search (e.g. scan user:)");
+        System.out.println("  range <from> <to> [limit]    - Range search (e.g. range a m)");
+        System.out.println("  compact                      - Trigger atomic log compaction");
+        System.out.println("  stats                        - Display telemetry and file size");
+        System.out.println("  size                         - Active key count");
+        System.out.println("  exit / quit                  - Exit CLI");
 
         try (StorageEngine engine = new StorageEngine(walFile)) {
             var recovery = engine.getLastRecoveryResult();
@@ -40,14 +49,18 @@ public final class Cli {
                 line = line.trim();
                 if (line.isEmpty()) { System.out.print("> "); continue; }
 
-                String[] parts = line.split("\\s+", 3);
+                String[] parts = line.split("\\s+");
                 String cmd = parts[0].toLowerCase();
 
                 try {
                     switch (cmd) {
                         case "put" -> {
                             if (parts.length < 3) System.out.println("Usage: put <key> <value>");
-                            else { engine.put(parts[1], parts[2]); System.out.println("OK (durably written)"); }
+                            else {
+                                String val = line.substring(line.indexOf(parts[1]) + parts[1].length()).trim();
+                                engine.put(parts[1], val);
+                                System.out.println("OK (durably written)");
+                            }
                         }
                         case "get" -> {
                             if (parts.length < 2) System.out.println("Usage: get <key>");
@@ -59,6 +72,38 @@ public final class Cli {
                         case "delete" -> {
                             if (parts.length < 2) System.out.println("Usage: delete <key>");
                             else { engine.delete(parts[1]); System.out.println("OK (deletion durably logged)"); }
+                        }
+                        case "scan" -> {
+                            if (parts.length < 2) System.out.println("Usage: scan <prefix> [limit]");
+                            else {
+                                int limit = parts.length > 2 ? Integer.parseInt(parts[2]) : 50;
+                                var results = engine.scan(parts[1], limit);
+                                System.out.println("Found " + results.size() + " matching keys:");
+                                results.forEach((k, v) -> System.out.println("  " + k + " = " + v));
+                            }
+                        }
+                        case "range" -> {
+                            if (parts.length < 3) System.out.println("Usage: range <from> <to> [limit]");
+                            else {
+                                int limit = parts.length > 3 ? Integer.parseInt(parts[3]) : 50;
+                                var results = engine.range(parts[1], parts[2], limit);
+                                System.out.println("Found " + results.size() + " keys in range:");
+                                results.forEach((k, v) -> System.out.println("  " + k + " = " + v));
+                            }
+                        }
+                        case "compact" -> {
+                            var res = engine.compact();
+                            System.out.println("Compaction completed: " + res.bytesBefore() + " bytes -> " +
+                                    res.bytesAfter() + " bytes (reclaimed " + res.bytesReclaimed() +
+                                    " bytes, retained " + res.keysRetained() + " keys)");
+                        }
+                        case "stats" -> {
+                            var s = engine.getStats();
+                            System.out.println("Engine Statistics:");
+                            System.out.println("  Active keys:            " + s.keyCount());
+                            System.out.println("  WAL file size:          " + s.walFileSizeBytes() + " bytes");
+                            System.out.println("  Current sequence num:   " + s.currentSequenceNumber());
+                            System.out.println("  Startup recovered keys: " + s.recoveredEntriesCount());
                         }
                         case "size" -> System.out.println(engine.size() + " keys currently in store");
                         case "exit", "quit" -> { System.out.println("Bye."); return; }

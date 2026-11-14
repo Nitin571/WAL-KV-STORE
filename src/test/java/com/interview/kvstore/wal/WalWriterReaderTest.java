@@ -78,4 +78,26 @@ class WalWriterReaderTest {
             assertEquals("value-✅-日本語", entry.value);
         }
     }
+
+    @Test
+    void emptyStringValueIsPreservedNotConflatedWithNull() throws Exception {
+        // A PUT with an empty string value ("") is a valid operation that is
+        // semantically different from a DELETE (null value). The serialized
+        // form has valLen == 0 for both, so the reader must use OpType to
+        // distinguish them. Before the fix, both deserialized to value=null.
+        try (WalWriter writer = new WalWriter(walFile, 0)) {
+            writer.appendPut("key1", "");         // empty-string value
+            writer.appendDelete("key2");           // null value
+        }
+
+        try (WalReader reader = new WalReader(walFile)) {
+            WalEntry putEntry = reader.next();
+            assertEquals(WalEntry.OpType.PUT, putEntry.opType);
+            assertEquals("", putEntry.value, "PUT with empty string must deserialize to \"\", not null");
+
+            WalEntry deleteEntry = reader.next();
+            assertEquals(WalEntry.OpType.DELETE, deleteEntry.opType);
+            assertNull(deleteEntry.value, "DELETE must deserialize to null value");
+        }
+    }
 }
