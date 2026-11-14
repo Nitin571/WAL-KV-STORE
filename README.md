@@ -59,6 +59,10 @@ A production-grade Write-Ahead Log (WAL) key-value database engine built from ra
    * **Corrupted records** (bad CRC32, impossible lengths, sequence number breaks) cause recovery to fail loudly with `StorageException` rather than silently deleting data.
 3. **Continuous Monotonic Sequence Numbers:** Sequence numbers must be strictly consecutive (`0, 1, 2, ...`). Any gap or duplicate is detected as corruption.
 4. **Clean Decoupling of PUT vs DELETE:** `PUT key ""` (empty string) and `DELETE key` are cleanly distinguished during deserialization.
+5. **Exclusive Process File Locking:** `StorageEngine` acquires an exclusive OS-level `FileLock` on `<walFile>.lock` upon initialization. This prevents two active processes (e.g. CLI and Spring Boot server) from corrupting the same WAL file simultaneously.
+6. **Pre-Write Buffer Size Guard:** `WalWriter` strictly validates total entry payload bytes before memory allocation or advancing sequence numbers, preventing integer overflows or OutOfMemory spikes.
+7. **Compaction Resilience & POSIX Directory Fsync:** If compaction file replacement fails, `StorageEngine` recovers by restoring an active writer on the intact original file. Following replacement, the parent directory table is fsynced to ensure rename metadata is physically flushed to disk.
+8. **Deep Readiness Health Probes:** `/admin/health` actively probes `StorageEngine`'s operational status (valid lock and open write channel) instead of returning a static response.
 
 ---
 

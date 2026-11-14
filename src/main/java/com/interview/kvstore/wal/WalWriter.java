@@ -36,12 +36,14 @@ public final class WalWriter implements AutoCloseable {
     }
 
     public synchronized WalEntry appendPut(String key, String value) throws IOException {
+        validateEntrySize(key, value);
         WalEntry entry = new WalEntry(nextSeq.getAndIncrement(), WalEntry.OpType.PUT, key, value);
         writeAndForce(entry);
         return entry;
     }
 
     public synchronized WalEntry appendDelete(String key) throws IOException {
+        validateEntrySize(key, null);
         WalEntry entry = new WalEntry(nextSeq.getAndIncrement(), WalEntry.OpType.DELETE, key, null);
         writeAndForce(entry);
         return entry;
@@ -57,6 +59,10 @@ public final class WalWriter implements AutoCloseable {
         if (ops == null || ops.isEmpty()) {
             return java.util.List.of();
         }
+        for (BatchOp op : ops) {
+            validateEntrySize(op.key(), op.value());
+        }
+
         java.util.List<WalEntry> entries = new java.util.ArrayList<>(ops.size());
         java.util.List<byte[]> byteArrays = new java.util.ArrayList<>(ops.size());
         int totalBytes = 0;
@@ -81,6 +87,24 @@ public final class WalWriter implements AutoCloseable {
         channel.force(true);
 
         return entries;
+    }
+
+    private static void validateEntrySize(String key, String value) {
+        if (key == null) {
+            throw new IllegalArgumentException("Key cannot be null");
+        }
+        int keyBytesLen = key.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        int valBytesLen = (value == null) ? 0 : value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        long totalEntryBytes = 4L + 8L + 1L + 4L + keyBytesLen + 4L + valBytesLen + 4L;
+        if (totalEntryBytes > WalReader.MAX_ENTRY_SIZE_BYTES) {
+            throw new IllegalArgumentException(
+                    "Total serialized entry size " + totalEntryBytes + " bytes exceeds MAX_ENTRY_SIZE_BYTES limit (" +
+                            WalReader.MAX_ENTRY_SIZE_BYTES + " bytes)");
+        }
+    }
+
+    public boolean isOpen() {
+        return channel.isOpen();
     }
 
     private void writeAndForce(WalEntry entry) throws IOException {

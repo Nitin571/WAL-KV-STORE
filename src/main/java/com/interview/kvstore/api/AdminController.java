@@ -27,7 +27,19 @@ public class AdminController {
 
     @GetMapping("/health")
     public ResponseEntity<?> health() {
-        return ResponseEntity.ok(Map.of("status", "UP"));
+        if (engine.isHealthy()) {
+            return ResponseEntity.ok(Map.of(
+                    "status", "UP",
+                    "walWritable", true,
+                    "keyCount", engine.size()
+            ));
+        } else {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of(
+                    "status", "DOWN",
+                    "walWritable", false,
+                    "error", "Storage engine is closed or lock lost"
+            ));
+        }
     }
 
     @GetMapping("/stats")

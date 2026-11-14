@@ -100,4 +100,15 @@ class WalWriterReaderTest {
             assertNull(deleteEntry.value, "DELETE must deserialize to null value");
         }
     }
+
+    @Test
+    void rejectsEntryExceedingMaxEntrySizeBytesBeforeAllocation() throws Exception {
+        try (WalWriter writer = new WalWriter(walFile, 0)) {
+            String hugeKey = "k".repeat(17 * 1024 * 1024);
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> writer.appendPut(hugeKey, "val"));
+            assertTrue(ex.getMessage().contains("MAX_ENTRY_SIZE_BYTES"));
+            assertEquals(0, writer.currentSequence(), "Sequence number must not advance on rejected write");
+        }
+    }
 }

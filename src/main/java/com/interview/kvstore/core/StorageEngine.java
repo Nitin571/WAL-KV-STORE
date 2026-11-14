@@ -9,10 +9,13 @@ import com.interview.kvstore.wal.WalEntry;
 import com.interview.kvstore.wal.WalWriter;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,16 +29,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * code actually talks to; it hides the WAL/recovery/compaction machinery behind a
  * rich CRUD, range-query, and batch-write API.
  *
- * Key capabilities:
+ * Operational hardening:
  *   1. Write-Ahead Logging with hardware fsync guarantees durability.
- *   2. ConcurrentSkipListMap powers lock-free reads and O(log N) prefix/range scans.
- *   3. Group Commit / Batching: write multiple keys in a single fsync.
- *   4. Zero-loss Atomic Compaction: reclaims disk space from deleted/overwritten
- *      keys without taking down the service.
+ *   2. Exclusive inter-process FileLock prevents multi-instance WAL corruption.
+ *   3. ConcurrentSkipListMap powers lock-free reads and O(log N) prefix/range scans.
+ *   4. Group Commit / Batching: write multiple keys in a single fsync.
+ *   5. Zero-loss Atomic Compaction with POSIX parent directory fsync and failure recovery.
  */
 public final class StorageEngine implements AutoCloseable {
 
-    public static final long DEFAULT_AUTO_COMPACT_THRESHOLD_BYTES = 50 * 1024 * 1024L; // 50 MB
+    public static final long DEFAULT_AUTO_COMPACT_THRESHOLD_BYTES = 10 * 1024 * 1024L; // 10 MB
 
     public record EngineStats(
             int keyCount,
@@ -51,6 +54,9 @@ public final class StorageEngine implements AutoCloseable {
     private final long autoCompactThresholdBytes;
     private final RecoveryResult lastRecovery;
     private final ReentrantLock writeLock = new ReentrantLock();
+
+    private final FileChannel lockChannel;
+    private final FileLock fileLock;
 
     private WalWriter writer;
     private volatile long lastCompactedAt = -1;
@@ -70,6 +76,35 @@ public final class StorageEngine implements AutoCloseable {
         } catch (IOException e) {
             throw new StorageException("Failed to create parent directory for WAL file: " + walFile, e);
         }
+
+        // Acquire exclusive inter-process lock on <walFile>.lock to prevent
+        // multiple running instances from corrupting the WAL file simultaneously.
+        Path lockPath = walFile.getParent() != null
+                ? walFile.getParent().resolve(walFile.getFileName().toString() + ".lock")
+                : Path.of(walFile.getFileName().toString() + ".lock");
+        FileChannel ch = null;
+        FileLock lk = null;
+        try {
+            ch = FileChannel.open(lockPath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            lk = ch.tryLock();
+            if (lk == null) {
+                ch.close();
+                throw new StorageException("Exclusive lock could not be acquired for WAL file (already in use by another process): " + walFile);
+            }
+        } catch (java.nio.channels.OverlappingFileLockException e) {
+            try {
+                if (ch != null) ch.close();
+            } catch (Exception ignored) {}
+            throw new StorageException("Exclusive lock could not be acquired for WAL file (already locked in this process): " + walFile, e);
+        } catch (IOException e) {
+            try {
+                if (ch != null) ch.close();
+            } catch (Exception ignored) {}
+            throw new StorageException("Failed to open or lock WAL lockfile: " + lockPath, e);
+        }
+        this.lockChannel = ch;
+        this.fileLock = lk;
 
         this.lastRecovery = RecoveryManager.recover(walFile);
 
@@ -245,21 +280,48 @@ public final class StorageEngine implements AutoCloseable {
                 Files.move(tmpFile, walFile, StandardCopyOption.REPLACE_EXISTING);
             }
 
-            // Step 4: Reopen writer on the clean compacted file
+            // Step 4: POSIX Parent directory fsync to guarantee directory metadata update is flushed to disk
+            syncParentDirectory(walFile);
+
+            // Step 5: Reopen writer on the clean compacted file
             this.writer = new WalWriter(walFile, seq);
             this.lastCompactedAt = System.currentTimeMillis();
 
             long sizeAfter = Files.exists(walFile) ? Files.size(walFile) : 0;
             return new CompactionResult(sizeBefore, sizeAfter, data.size());
         } catch (IOException e) {
+            // Harden compaction failure recovery: if anything fails after writer is closed,
+            // clean up the tmpFile and restore a working WalWriter on the intact original file.
             try {
-                if (this.writer == null) {
+                Path parent = walFile.getParent();
+                Path tmpFile = parent != null
+                        ? parent.resolve(walFile.getFileName().toString() + ".compact.tmp")
+                        : Path.of(walFile.getFileName().toString() + ".compact.tmp");
+                Files.deleteIfExists(tmpFile);
+            } catch (Exception ignored) {}
+
+            try {
+                if (this.writer == null || !this.writer.isOpen()) {
                     this.writer = new WalWriter(walFile, data.size());
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception restoreEx) {
+                System.err.println("Fatal: Unable to restore WalWriter following compaction failure: " + restoreEx.getMessage());
+            }
+
             throw new StorageException("Failed to compact WAL file: " + walFile, e);
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    private static void syncParentDirectory(Path file) {
+        Path parent = file.getParent();
+        if (parent != null) {
+            try (FileChannel dirChannel = FileChannel.open(parent, StandardOpenOption.READ)) {
+                dirChannel.force(true);
+            } catch (Exception ignored) {
+                // Not supported on some OSes/filesystems (e.g. Windows NTFS)
+            }
         }
     }
 
@@ -271,6 +333,15 @@ public final class StorageEngine implements AutoCloseable {
             }
         } catch (Exception e) {
             System.err.println("Warning: Auto-compaction failed: " + e.getMessage());
+        }
+    }
+
+    public boolean isHealthy() {
+        writeLock.lock();
+        try {
+            return writer != null && writer.isOpen() && fileLock != null && fileLock.isValid();
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -300,6 +371,16 @@ public final class StorageEngine implements AutoCloseable {
                 writer.close();
             }
         } finally {
+            try {
+                if (fileLock != null && fileLock.isValid()) {
+                    fileLock.release();
+                }
+            } catch (IOException ignored) {}
+            try {
+                if (lockChannel != null) {
+                    lockChannel.close();
+                }
+            } catch (IOException ignored) {}
             writeLock.unlock();
         }
     }

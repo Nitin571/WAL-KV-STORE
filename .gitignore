@@ -4,6 +4,8 @@ out/
 target/
 *.class
 wal-data/*.wal
+wal-data/*.lock
+*.lock
 .DS_Store
 **/.DS_Store
 *.tmp
