@@ -66,6 +66,29 @@ A production-grade Write-Ahead Log (WAL) key-value database engine built from ra
 
 ---
 
+## Quickstart: Running Locally
+
+### Prerequisites
+* Java 17 or higher (`java -version`)
+* Maven 3.8 or higher (`mvn -version`)
+
+### 1. Start the HTTP Server
+```bash
+mvn spring-boot:run
+```
+The server will start on port `8080` using `./wal-data/store.wal`.
+
+### 2. Verify Readiness
+```bash
+curl http://localhost:8080/admin/health
+```
+Expected output:
+```json
+{"status":"UP","walWritable":true,"keyCount":0}
+```
+
+---
+
 ## REST API Reference
 
 The server runs on port `8080` by default.
@@ -164,6 +187,41 @@ Commands supported:
 * `stats`
 * `size`
 * `exit`
+
+---
+
+## Live Crash & Recovery Demonstration
+
+The repository includes `SlowWriteDemo` to demonstrate genuine mid-write crash recovery:
+
+1. **Compile the classes:**
+   ```bash
+   mvn compile
+   ```
+
+2. **Start a slow write:**
+   ```bash
+   java -cp target/classes com.interview.kvstore.tools.SlowWriteDemo wal-data/demo.wal 10
+   ```
+   This writes 2 complete entries, then writes only the first half of a 3rd entry (creating a genuine torn write on disk), prints its PID, and sleeps for 10 seconds.
+
+3. **Simulate a crash:**
+   From a second terminal before the timer expires:
+   ```bash
+   kill -9 <PID>
+   ```
+
+4. **Verify recovery:**
+   Open the WAL using the interactive CLI:
+   ```bash
+   java -cp target/classes:target/test-classes com.interview.kvstore.tools.Cli wal-data/demo.wal
+   ```
+   Output:
+   ```text
+   StorageEngine initialized with WAL wal-data/demo.wal. Recovered 2 entries (torn write detected: true)
+   ```
+   * `goodkey1` and `goodkey2` are fully intact.
+   * The torn 3rd entry was detected via CRC32/size validation and cleanly discarded.
 
 ---
 
