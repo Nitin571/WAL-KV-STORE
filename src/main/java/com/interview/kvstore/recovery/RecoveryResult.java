@@ -16,12 +16,22 @@ public final class RecoveryResult {
     public final long validByteLength; // file gets truncated to this length if a torn write was found
     public final boolean tornWriteFound;
     public final String tornWriteDescription; // null if tornWriteFound is false
+    public final int walFormatVersion; // 1 for legacy, 2 for integrity
+    public final byte[] lastHmacTag; // null for legacy, 32 bytes for integrity
 
     public RecoveryResult(List<WalEntry> recoveredEntries, long validByteLength,
                            boolean tornWriteFound, String tornWriteDescription) {
+        this(recoveredEntries, validByteLength, tornWriteFound, tornWriteDescription, 1, null);
+    }
+
+    public RecoveryResult(List<WalEntry> recoveredEntries, long validByteLength,
+                           boolean tornWriteFound, String tornWriteDescription,
+                           int walFormatVersion, byte[] lastHmacTag) {
         this.recoveredEntries = recoveredEntries;
         this.validByteLength = validByteLength;
         this.tornWriteFound = tornWriteFound;
         this.tornWriteDescription = tornWriteDescription;
+        this.walFormatVersion = walFormatVersion;
+        this.lastHmacTag = (lastHmacTag != null) ? lastHmacTag.clone() : null;
     }
 }

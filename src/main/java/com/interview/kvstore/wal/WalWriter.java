@@ -25,27 +25,84 @@ public final class WalWriter implements AutoCloseable {
 
     private final FileChannel channel;
     private final AtomicLong nextSeq;
+    private final byte[] integritySecret;
+    private byte[] lastHmacTag;
 
     public WalWriter(Path walFile, long startingSeq) throws IOException {
+        this(walFile, startingSeq, null, null);
+    }
+
+    public WalWriter(Path walFile, long startingSeq, byte[] integritySecret, byte[] startingHmacTag) throws IOException {
         this.channel = FileChannel.open(
                 walFile,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
                 StandardOpenOption.APPEND);
         this.nextSeq = new AtomicLong(startingSeq);
+        this.integritySecret = (integritySecret != null && integritySecret.length > 0)
+                ? integritySecret.clone() : null;
+
+        if (this.integritySecret != null) {
+            if (channel.size() == 0) {
+                ByteBuffer header = ByteBuffer.allocate(WalIntegrity.HEADER_SIZE);
+                header.put(WalIntegrity.MAGIC_HEADER);
+                header.putInt(WalIntegrity.FORMAT_VERSION_2);
+                header.putInt(0); // flags / reserved
+                header.flip();
+                while (header.hasRemaining()) {
+                    channel.write(header);
+                }
+                channel.force(true);
+            }
+            this.lastHmacTag = (startingHmacTag != null)
+                    ? startingHmacTag.clone()
+                    : WalIntegrity.GENESIS_TAG.clone();
+        } else {
+            this.lastHmacTag = null;
+        }
     }
 
     public synchronized WalEntry appendPut(String key, String value) throws IOException {
         validateEntrySize(key, value);
-        WalEntry entry = new WalEntry(nextSeq.getAndIncrement(), WalEntry.OpType.PUT, key, value);
-        writeAndForce(entry);
+        long seq = nextSeq.getAndIncrement();
+        WalEntry entry;
+        byte[] bytesToWrite;
+
+        if (integritySecret != null) {
+            WalEntry proto = new WalEntry(seq, WalEntry.OpType.PUT, key, value);
+            byte[] canonical = proto.serializeCanonicalBeforeHmac();
+            byte[] tag = WalIntegrity.calculateHmac(integritySecret, lastHmacTag, canonical);
+            this.lastHmacTag = tag.clone();
+            bytesToWrite = proto.serializeWithHmac(tag);
+            entry = new WalEntry(seq, WalEntry.OpType.PUT, key, value, tag);
+        } else {
+            entry = new WalEntry(seq, WalEntry.OpType.PUT, key, value);
+            bytesToWrite = entry.serialize();
+        }
+
+        writeBuffer(bytesToWrite);
         return entry;
     }
 
     public synchronized WalEntry appendDelete(String key) throws IOException {
         validateEntrySize(key, null);
-        WalEntry entry = new WalEntry(nextSeq.getAndIncrement(), WalEntry.OpType.DELETE, key, null);
-        writeAndForce(entry);
+        long seq = nextSeq.getAndIncrement();
+        WalEntry entry;
+        byte[] bytesToWrite;
+
+        if (integritySecret != null) {
+            WalEntry proto = new WalEntry(seq, WalEntry.OpType.DELETE, key, null);
+            byte[] canonical = proto.serializeCanonicalBeforeHmac();
+            byte[] tag = WalIntegrity.calculateHmac(integritySecret, lastHmacTag, canonical);
+            this.lastHmacTag = tag.clone();
+            bytesToWrite = proto.serializeWithHmac(tag);
+            entry = new WalEntry(seq, WalEntry.OpType.DELETE, key, null, tag);
+        } else {
+            entry = new WalEntry(seq, WalEntry.OpType.DELETE, key, null);
+            bytesToWrite = entry.serialize();
+        }
+
+        writeBuffer(bytesToWrite);
         return entry;
     }
 
@@ -68,8 +125,22 @@ public final class WalWriter implements AutoCloseable {
         int totalBytes = 0;
 
         for (BatchOp op : ops) {
-            WalEntry entry = new WalEntry(nextSeq.getAndIncrement(), op.opType(), op.key(), op.value());
-            byte[] bytes = entry.serialize();
+            long seq = nextSeq.getAndIncrement();
+            WalEntry entry;
+            byte[] bytes;
+
+            if (integritySecret != null) {
+                WalEntry proto = new WalEntry(seq, op.opType(), op.key(), op.value());
+                byte[] canonical = proto.serializeCanonicalBeforeHmac();
+                byte[] tag = WalIntegrity.calculateHmac(integritySecret, lastHmacTag, canonical);
+                this.lastHmacTag = tag.clone();
+                bytes = proto.serializeWithHmac(tag);
+                entry = new WalEntry(seq, op.opType(), op.key(), op.value(), tag);
+            } else {
+                entry = new WalEntry(seq, op.opType(), op.key(), op.value());
+                bytes = entry.serialize();
+            }
+
             entries.add(entry);
             byteArrays.add(bytes);
             totalBytes += bytes.length;
@@ -89,6 +160,18 @@ public final class WalWriter implements AutoCloseable {
         return entries;
     }
 
+    public synchronized byte[] getLastHmacTag() {
+        return lastHmacTag != null ? lastHmacTag.clone() : null;
+    }
+
+    private void writeBuffer(byte[] bytes) throws IOException {
+        ByteBuffer buf = ByteBuffer.wrap(bytes);
+        while (buf.hasRemaining()) {
+            channel.write(buf);
+        }
+        channel.force(true);
+    }
+
     private static void validateEntrySize(String key, String value) {
         if (key == null) {
             throw new IllegalArgumentException("Key cannot be null");
@@ -105,14 +188,6 @@ public final class WalWriter implements AutoCloseable {
 
     public boolean isOpen() {
         return channel.isOpen();
-    }
-
-    private void writeAndForce(WalEntry entry) throws IOException {
-        ByteBuffer buf = ByteBuffer.wrap(entry.serialize());
-        while (buf.hasRemaining()) {
-            channel.write(buf);
-        }
-        channel.force(true); // the actual durability guarantee lives here
     }
 
     public long currentSequence() {

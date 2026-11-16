@@ -129,4 +129,36 @@ public class AdminController {
     public ResponseEntity<?> compact() {
         return compact(adminToken, null);
     }
+
+    @GetMapping("/integrity")
+    public ResponseEntity<?> integrity(
+            @RequestHeader(value = "X-Admin-Token", required = false) String adminTokenHeader,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+        if (!isAuthorized(adminTokenHeader, authHeader)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("error", "Unauthorized: Invalid or missing admin token"));
+        }
+
+        StorageEngine.IntegrityStatus status = engine.getIntegrityStatus();
+        if (!status.integrityEnabled()) {
+            return ResponseEntity.ok(Map.of(
+                    "status", "DISABLED",
+                    "integrityEnabled", false
+            ));
+        }
+
+        return ResponseEntity.ok(Map.of(
+                "status", status.status(),
+                "integrityEnabled", true,
+                "walFormatVersion", status.walFormatVersion(),
+                "verifiedEntries", status.verifiedEntries(),
+                "lastSequenceNumber", status.lastSequenceNumber(),
+                "chainRootPrefix", status.chainRootPrefix() != null ? status.chainRootPrefix() : ""
+        ));
+    }
+
+    /** Programmatic / test convenience overload */
+    public ResponseEntity<?> integrity() {
+        return integrity(adminToken, null);
+    }
 }

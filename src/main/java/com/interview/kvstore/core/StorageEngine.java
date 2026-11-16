@@ -6,11 +6,13 @@ import com.interview.kvstore.recovery.RecoveryManager;
 import com.interview.kvstore.recovery.RecoveryResult;
 import com.interview.kvstore.wal.BatchOp;
 import com.interview.kvstore.wal.WalEntry;
+import com.interview.kvstore.wal.WalIntegrity;
 import com.interview.kvstore.wal.WalWriter;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +38,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *   3. ConcurrentSkipListMap powers lock-free reads and O(log N) prefix/range scans.
  *   4. Group Commit / Batching: write multiple keys in a single fsync.
  *   5. Zero-loss Atomic Compaction with POSIX parent directory fsync and failure recovery.
+ *   6. Optional Cryptographic Tamper-Evident WAL Integrity Chain (HMAC-SHA-256).
  */
 public final class StorageEngine implements AutoCloseable {
 
@@ -54,9 +57,20 @@ public final class StorageEngine implements AutoCloseable {
             long compactionCount
     ) {}
 
+    public record IntegrityStatus(
+            String status,
+            boolean integrityEnabled,
+            int walFormatVersion,
+            int verifiedEntries,
+            long lastSequenceNumber,
+            String chainRootPrefix
+    ) {}
+
     private final ConcurrentSkipListMap<String, String> data = new ConcurrentSkipListMap<>();
     private final Path walFile;
     private final long autoCompactThresholdBytes;
+    private final boolean integrityEnabled;
+    private final byte[] integritySecret;
     private final RecoveryResult lastRecovery;
     private final ReentrantLock writeLock = new ReentrantLock();
 
@@ -71,12 +85,26 @@ public final class StorageEngine implements AutoCloseable {
     private volatile long lastCompactedAt = -1;
 
     public StorageEngine(Path walFile) throws StorageException {
-        this(walFile, DEFAULT_AUTO_COMPACT_THRESHOLD_BYTES);
+        this(walFile, DEFAULT_AUTO_COMPACT_THRESHOLD_BYTES, false, null);
     }
 
     public StorageEngine(Path walFile, long autoCompactThresholdBytes) throws StorageException {
+        this(walFile, autoCompactThresholdBytes, false, null);
+    }
+
+    public StorageEngine(Path walFile, long autoCompactThresholdBytes, boolean integrityEnabled, String integritySecretStr) throws StorageException {
         this.walFile = walFile;
         this.autoCompactThresholdBytes = autoCompactThresholdBytes;
+        this.integrityEnabled = integrityEnabled;
+
+        if (integrityEnabled) {
+            if (integritySecretStr == null || integritySecretStr.isBlank()) {
+                throw new StorageException("Startup failed: wal.integrity.enabled is true, but wal.integrity.secret is missing or blank");
+            }
+            this.integritySecret = integritySecretStr.getBytes(StandardCharsets.UTF_8);
+        } else {
+            this.integritySecret = null;
+        }
 
         try {
             if (walFile.getParent() != null) {
@@ -115,7 +143,7 @@ public final class StorageEngine implements AutoCloseable {
         this.lockChannel = ch;
         this.fileLock = lk;
 
-        this.lastRecovery = RecoveryManager.recover(walFile);
+        this.lastRecovery = RecoveryManager.recover(walFile, integritySecret);
 
         long lastSeq = -1;
         for (WalEntry entry : lastRecovery.recoveredEntries) {
@@ -124,13 +152,13 @@ public final class StorageEngine implements AutoCloseable {
         }
 
         try {
-            this.writer = new WalWriter(walFile, lastSeq + 1);
+            this.writer = new WalWriter(walFile, lastSeq + 1, integritySecret, lastRecovery.lastHmacTag);
         } catch (IOException e) {
             throw new StorageException("Failed to open WAL for writing: " + walFile, e);
         }
 
-        LOG.log(System.Logger.Level.INFO, "StorageEngine initialized with WAL {0}. Recovered {1} entries (torn write detected: {2})",
-                walFile, lastRecovery.recoveredEntries.size(), lastRecovery.tornWriteFound);
+        LOG.log(System.Logger.Level.INFO, "StorageEngine initialized with WAL {0}. Recovered {1} entries (torn write detected: {2}, format version: {3})",
+                walFile, lastRecovery.recoveredEntries.size(), lastRecovery.tornWriteFound, lastRecovery.walFormatVersion);
     }
 
     /** Exposes what happened during startup recovery, e.g. for logging or a health-check endpoint. */
@@ -284,11 +312,14 @@ public final class StorageEngine implements AutoCloseable {
 
             // Step 1: Write only currently live entries into the temporary file
             long seq = 0;
-            try (WalWriter tmpWriter = new WalWriter(tmpFile, 0)) {
+            byte[] startingTag = (integritySecret != null) ? WalIntegrity.GENESIS_TAG.clone() : null;
+            byte[] lastCompactedTag = startingTag;
+            try (WalWriter tmpWriter = new WalWriter(tmpFile, 0, integritySecret, startingTag)) {
                 for (Map.Entry<String, String> entry : data.entrySet()) {
                     tmpWriter.appendPut(entry.getKey(), entry.getValue());
                     seq++;
                 }
+                lastCompactedTag = tmpWriter.getLastHmacTag();
             }
 
             // Step 2: Safely close active writer
@@ -305,7 +336,7 @@ public final class StorageEngine implements AutoCloseable {
             syncParentDirectory(walFile);
 
             // Step 5: Reopen writer on the clean compacted file
-            this.writer = new WalWriter(walFile, seq);
+            this.writer = new WalWriter(walFile, seq, integritySecret, lastCompactedTag);
             this.lastCompactedAt = System.currentTimeMillis();
             totalCompactionOps.incrementAndGet();
 
@@ -326,7 +357,7 @@ public final class StorageEngine implements AutoCloseable {
 
             try {
                 if (this.writer == null || !this.writer.isOpen()) {
-                    this.writer = new WalWriter(walFile, data.size());
+                    this.writer = new WalWriter(walFile, data.size(), integritySecret, lastRecovery.lastHmacTag);
                 }
             } catch (Exception restoreEx) {
                 LOG.log(System.Logger.Level.ERROR, "Fatal: Unable to restore WalWriter following compaction failure: {0}", restoreEx.getMessage());
@@ -391,6 +422,29 @@ public final class StorageEngine implements AutoCloseable {
                 Math.round(avgLatencyMicros * 10.0) / 10.0,
                 totalCompactionOps.get()
         );
+    }
+
+    public boolean isIntegrityEnabled() {
+        return integrityEnabled;
+    }
+
+    public IntegrityStatus getIntegrityStatus() {
+        if (!integrityEnabled) {
+            return new IntegrityStatus("DISABLED", false, 1, 0, -1, null);
+        }
+
+        writeLock.lock();
+        try {
+            int formatVersion = lastRecovery != null ? lastRecovery.walFormatVersion : WalIntegrity.FORMAT_VERSION_2;
+            int verified = (writer != null) ? (int) writer.currentSequence() : (lastRecovery != null ? lastRecovery.recoveredEntries.size() : 0);
+            long lastSeq = (writer != null && writer.currentSequence() > 0) ? writer.currentSequence() - 1 : -1;
+            byte[] currentTag = (writer != null) ? writer.getLastHmacTag() : (lastRecovery != null ? lastRecovery.lastHmacTag : null);
+            String prefix = WalIntegrity.toHexPrefix(currentTag, 12);
+            String status = isHealthy() ? "VALID" : "UNAVAILABLE";
+            return new IntegrityStatus(status, true, formatVersion, verified, lastSeq, prefix);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     @Override

@@ -19,7 +19,9 @@ public class StoreConfig {
     @Bean(destroyMethod = "close")
     public StorageEngine storageEngine(
             @Value("${wal.file:./wal-data/store.wal}") String walFilePath,
-            @Value("${wal.auto-compact.threshold-bytes:10485760}") long autoCompactBytes) throws Exception {
-        return new StorageEngine(Path.of(walFilePath), autoCompactBytes);
+            @Value("${wal.auto-compact.threshold-bytes:10485760}") long autoCompactBytes,
+            @Value("${wal.integrity.enabled:false}") boolean integrityEnabled,
+            @Value("${wal.integrity.secret:}") String integritySecret) throws Exception {
+        return new StorageEngine(Path.of(walFilePath), autoCompactBytes, integrityEnabled, integritySecret);
     }
 }

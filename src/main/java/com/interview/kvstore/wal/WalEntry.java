@@ -45,15 +45,25 @@ public final class WalEntry {
     public final OpType opType;
     public final String key;
     public final String value; // null for DELETE
+    public final byte[] hmacTag; // null for legacy v1, 32 bytes for integrity v2
 
     public WalEntry(long sequenceNumber, OpType opType, String key, String value) {
+        this(sequenceNumber, opType, key, value, null);
+    }
+
+    public WalEntry(long sequenceNumber, OpType opType, String key, String value, byte[] hmacTag) {
         this.sequenceNumber = sequenceNumber;
         this.opType = opType;
         this.key = key;
         this.value = value;
+        this.hmacTag = (hmacTag != null) ? hmacTag.clone() : null;
     }
 
-    /** Serializes this entry to the exact bytes written to the log file. */
+    public byte[] getHmacTag() {
+        return hmacTag != null ? hmacTag.clone() : null;
+    }
+
+    /** Serializes this entry to the legacy (v1) format. */
     public byte[] serialize() {
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         byte[] valBytes = (value == null) ? new byte[0] : value.getBytes(StandardCharsets.UTF_8);
@@ -79,6 +89,51 @@ public final class WalEntry {
         return full.array();
     }
 
+    /**
+     * Serializes the canonical bytes of this record before the HMAC tag:
+     * [4 bytes: totalDeclaredLength] [body bytes] [4 bytes: crc32]
+     * where totalDeclaredLength = bodyLen + 4 + 32 (TAG_LENGTH).
+     */
+    public byte[] serializeCanonicalBeforeHmac() {
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+        byte[] valBytes = (value == null) ? new byte[0] : value.getBytes(StandardCharsets.UTF_8);
+
+        int bodyLen = 8 + 1 + 4 + keyBytes.length + 4 + valBytes.length;
+
+        ByteBuffer body = ByteBuffer.allocate(bodyLen);
+        body.putLong(sequenceNumber);
+        body.put(opType.code);
+        body.putInt(keyBytes.length);
+        body.put(keyBytes);
+        body.putInt(valBytes.length);
+        body.put(valBytes);
+
+        CRC32 crc = new CRC32();
+        crc.update(body.array());
+        int checksum = (int) crc.getValue();
+
+        int totalLen = bodyLen + 4 + WalIntegrity.TAG_LENGTH;
+        ByteBuffer canonical = ByteBuffer.allocate(4 + bodyLen + 4);
+        canonical.putInt(totalLen);
+        canonical.put(body.array());
+        canonical.putInt(checksum);
+        return canonical.array();
+    }
+
+    /**
+     * Serializes complete record including the 32-byte HMAC tag for format v2.
+     */
+    public byte[] serializeWithHmac(byte[] tag) {
+        if (tag == null || tag.length != WalIntegrity.TAG_LENGTH) {
+            throw new IllegalArgumentException("HMAC tag must be exactly " + WalIntegrity.TAG_LENGTH + " bytes");
+        }
+        byte[] canonical = serializeCanonicalBeforeHmac();
+        ByteBuffer full = ByteBuffer.allocate(canonical.length + WalIntegrity.TAG_LENGTH);
+        full.put(canonical);
+        full.put(tag);
+        return full.array();
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
@@ -86,17 +141,19 @@ public final class WalEntry {
         return sequenceNumber == other.sequenceNumber
                 && opType == other.opType
                 && key.equals(other.key)
-                && java.util.Objects.equals(value, other.value);
+                && java.util.Objects.equals(value, other.value)
+                && java.util.Arrays.equals(hmacTag, other.hmacTag);
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(sequenceNumber, opType, key, value);
+        return java.util.Objects.hash(sequenceNumber, opType, key, value, java.util.Arrays.hashCode(hmacTag));
     }
 
     @Override
     public String toString() {
         return "WalEntry{seq=" + sequenceNumber + ", op=" + opType +
-                ", key='" + key + "', value=" + (value == null ? "null" : "'" + value + "'") + "}";
+                ", key='" + key + "', value=" + (value == null ? "null" : "'" + value + "'") +
+                (hmacTag != null ? ", hmac=" + WalIntegrity.toHexPrefix(hmacTag, 8) + "..." : "") + "}";
     }
 }

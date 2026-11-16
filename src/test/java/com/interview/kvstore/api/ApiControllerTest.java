@@ -97,5 +97,13 @@ class ApiControllerTest {
         Map<String, Object> compactBody = (Map<String, Object>) compactRes.getBody();
         assertNotNull(compactBody);
         assertEquals("compacted", compactBody.get("status"));
+
+        ResponseEntity<?> integrityRes = adminController.integrity();
+        assertEquals(HttpStatus.OK, integrityRes.getStatusCode());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> integrityBody = (Map<String, Object>) integrityRes.getBody();
+        assertNotNull(integrityBody);
+        assertEquals("DISABLED", integrityBody.get("status"));
+        assertEquals(false, integrityBody.get("integrityEnabled"));
     }
 }

@@ -47,12 +47,56 @@ public final class WalReader implements AutoCloseable {
 
     private final FileChannel channel;
     private final long fileSize;
+    private final byte[] integritySecret;
+    private final int formatVersion;
     private long pos;
+    private byte[] lastHmacTag;
 
     public WalReader(Path walFile) throws IOException {
+        this(walFile, null);
+    }
+
+    public WalReader(Path walFile, byte[] integritySecret) throws IOException {
         this.channel = FileChannel.open(walFile, StandardOpenOption.READ);
         this.fileSize = channel.size();
-        this.pos = 0;
+        this.integritySecret = (integritySecret != null && integritySecret.length > 0)
+                ? integritySecret.clone() : null;
+
+        if (fileSize >= WalIntegrity.HEADER_SIZE) {
+            ByteBuffer hBuf = ByteBuffer.allocate(WalIntegrity.HEADER_SIZE);
+            readFully(hBuf, 0);
+            hBuf.flip();
+            byte[] magic = new byte[8];
+            hBuf.get(magic);
+            int version = hBuf.getInt();
+            int flags = hBuf.getInt();
+
+            if (java.util.Arrays.equals(magic, WalIntegrity.MAGIC_HEADER) && version == WalIntegrity.FORMAT_VERSION_2) {
+                this.formatVersion = 2;
+                this.pos = WalIntegrity.HEADER_SIZE;
+                this.lastHmacTag = WalIntegrity.GENESIS_TAG.clone();
+            } else {
+                this.formatVersion = 1;
+                this.pos = 0;
+                this.lastHmacTag = null;
+            }
+        } else {
+            this.formatVersion = 1;
+            this.pos = 0;
+            this.lastHmacTag = null;
+        }
+    }
+
+    public int getFormatVersion() {
+        return formatVersion;
+    }
+
+    public byte[] getLastHmacTag() {
+        return lastHmacTag != null ? lastHmacTag.clone() : null;
+    }
+
+    public long getHeaderSize() {
+        return formatVersion == 2 ? WalIntegrity.HEADER_SIZE : 0;
     }
 
     public long position() {
@@ -73,42 +117,91 @@ public final class WalReader implements AutoCloseable {
         ByteBuffer lenBuf = ByteBuffer.allocate(4);
         readFully(lenBuf, pos);
         lenBuf.flip();
-        int bodyPlusChecksumLen = lenBuf.getInt();
+        int declaredLen = lenBuf.getInt();
 
-        // Validate the declared size BEFORE allocating anything based on
-        // it. A negative or absurdly large value is treated as corrupt,
-        // not as "let's try to allocate that much and see what happens."
-        if (bodyPlusChecksumLen <= 0) {
-            // A zero or negative length is structurally impossible from a
-            // normal append: WalWriter always writes a positive body+checksum
-            // length. A negative value (high bit set) is a bit-flip or
-            // corruption, not a crash artifact -- surface it as corruption so
-            // recovery doesn't silently truncate valid data that may follow.
+        if (declaredLen <= 0) {
             throw new CorruptedEntryException(recordStart,
-                    "declared entry size " + bodyPlusChecksumLen + " is zero or negative -- " +
+                    "declared entry size " + declaredLen + " is zero or negative -- " +
                     "this is not a plausible crash artifact and indicates corruption");
         }
-        if (bodyPlusChecksumLen > MAX_ENTRY_SIZE_BYTES) {
+
+        if (formatVersion == 2) {
+            int minIntegrityLen = 21 + WalIntegrity.TAG_LENGTH;
+            if (declaredLen < minIntegrityLen) {
+                throw new CorruptedEntryException(recordStart,
+                        "declared entry size " + declaredLen + " bytes is smaller than the minimum integrity entry size (" +
+                                minIntegrityLen + " bytes)");
+            }
+            if (declaredLen > MAX_ENTRY_SIZE_BYTES + WalIntegrity.TAG_LENGTH) {
+                throw new CorruptedEntryException(recordStart,
+                        "declared entry size " + declaredLen + " bytes exceeds the sanity limit");
+            }
+
+            long recordTotalLen = 4L + declaredLen;
+            if (recordStart + recordTotalLen > fileSize) {
+                throw new TornWriteException(recordStart);
+            }
+
+            ByteBuffer entryBuf = ByteBuffer.allocate(declaredLen);
+            readFully(entryBuf, pos + 4);
+            entryBuf.flip();
+
+            byte[] all = entryBuf.array();
+            int bodyPlusCrcLen = declaredLen - WalIntegrity.TAG_LENGTH;
+            byte[] bodyAndChecksum = new byte[bodyPlusCrcLen];
+            System.arraycopy(all, 0, bodyAndChecksum, 0, bodyPlusCrcLen);
+            byte[] tag = new byte[WalIntegrity.TAG_LENGTH];
+            System.arraycopy(all, bodyPlusCrcLen, tag, 0, WalIntegrity.TAG_LENGTH);
+
+            int bodyLen = bodyPlusCrcLen - 4;
+            byte[] body = new byte[bodyLen];
+            System.arraycopy(bodyAndChecksum, 0, body, 0, bodyLen);
+            int storedChecksum = ByteBuffer.wrap(bodyAndChecksum, bodyLen, 4).getInt();
+
+            CRC32 crc = new CRC32();
+            crc.update(body);
+            int actualChecksum = (int) crc.getValue();
+
+            if (actualChecksum != storedChecksum) {
+                throw new CorruptedEntryException(recordStart, "CRC32 checksum mismatch in integrity record");
+            }
+
+            ByteBuffer canonicalBuf = ByteBuffer.allocate(4 + bodyPlusCrcLen);
+            canonicalBuf.putInt(declaredLen);
+            canonicalBuf.put(bodyAndChecksum);
+            byte[] canonicalBytes = canonicalBuf.array();
+
+            if (integritySecret != null) {
+                if (!WalIntegrity.verifyHmac(integritySecret, lastHmacTag, canonicalBytes, tag)) {
+                    throw new CorruptedEntryException(recordStart,
+                            "HMAC integrity verification failed for record at byte offset " + recordStart);
+                }
+                this.lastHmacTag = tag.clone();
+            }
+
+            WalEntry entry = parseBody(body, recordStart, tag);
+            pos += recordTotalLen;
+            return entry;
+        }
+
+        // Format Version 1 (Legacy)
+        if (declaredLen > MAX_ENTRY_SIZE_BYTES) {
             throw new CorruptedEntryException(recordStart,
-                    "declared entry size " + bodyPlusChecksumLen + " bytes exceeds the " +
+                    "declared entry size " + declaredLen + " bytes exceeds the " +
                             MAX_ENTRY_SIZE_BYTES + "-byte sanity limit -- refusing to allocate a buffer for it");
         }
 
-        long recordTotalLen = 4L + bodyPlusChecksumLen;
+        long recordTotalLen = 4L + declaredLen;
         if (recordStart + recordTotalLen > fileSize) {
-            // Declares more bytes than actually exist in the file -- the
-            // file simply ends here. This is a torn write, not corruption:
-            // the length field itself is plausible, there just isn't
-            // enough file left to satisfy it (a real crash mid-write).
             throw new TornWriteException(recordStart);
         }
 
-        ByteBuffer bodyAndChecksum = ByteBuffer.allocate(bodyPlusChecksumLen);
+        ByteBuffer bodyAndChecksum = ByteBuffer.allocate(declaredLen);
         readFully(bodyAndChecksum, pos + 4);
         bodyAndChecksum.flip();
 
         byte[] all = bodyAndChecksum.array();
-        int bodyLen = bodyPlusChecksumLen - 4;
+        int bodyLen = declaredLen - 4;
         byte[] body = new byte[bodyLen];
         System.arraycopy(all, 0, body, 0, bodyLen);
         int storedChecksum = ByteBuffer.wrap(all, bodyLen, 4).getInt();
@@ -121,22 +214,16 @@ public final class WalReader implements AutoCloseable {
             throw new CorruptedEntryException(recordStart);
         }
 
-        WalEntry entry = parseBody(body, recordStart);
+        WalEntry entry = parseBody(body, recordStart, null);
         pos += recordTotalLen;
         return entry;
     }
 
-    /**
-     * Parses the body bytes into a WalEntry, validating structure along
-     * the way: key/value lengths must be non-negative and must not run
-     * past the bytes actually available, the op code must be a known
-     * value, and after reading everything the buffer must be exactly
-     * exhausted (no leftover bytes, no premature end) -- any mismatch
-     * there means the declared lengths don't actually describe the
-     * content, which is corruption even though the checksum happened to
-     * pass (extremely unlikely, but defense in depth costs little here).
-     */
     private static WalEntry parseBody(byte[] body, long recordStart) throws CorruptedEntryException {
+        return parseBody(body, recordStart, null);
+    }
+
+    private static WalEntry parseBody(byte[] body, long recordStart, byte[] hmacTag) throws CorruptedEntryException {
         try {
             ByteBuffer buf = ByteBuffer.wrap(body);
             long seq = buf.getLong();
@@ -184,7 +271,7 @@ public final class WalReader implements AutoCloseable {
                         buf.remaining() + " unexplained trailing bytes after parsing all declared fields");
             }
 
-            return new WalEntry(seq, op, key, value);
+            return new WalEntry(seq, op, key, value, hmacTag);
         } catch (BufferUnderflowException e) {
             // Any field read that ran past the buffer's actual bytes ends
             // up here -- also corruption, not a torn write, since we

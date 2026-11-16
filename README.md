@@ -64,6 +64,14 @@ A production-grade Write-Ahead Log (WAL) key-value database engine built from ra
 7. **Compaction Resilience & POSIX Directory Fsync:** If compaction file replacement fails, `StorageEngine` recovers by restoring an active writer on the intact original file. Following replacement, the parent directory table is fsynced to ensure rename metadata is physically flushed to disk.
 8. **Deep Readiness Health Probes:** `/admin/health` actively probes `StorageEngine`'s operational status (valid lock and open write channel) instead of returning a static response.
 
+### 5. Tamper-Evident WAL Integrity Chain (HMAC-SHA-256)
+* **Problem Solved:** Traditional CRC32 checksums only defend against accidental bit-flips or truncated writes; an attacker with file access can easily alter records in a hex editor and recalculate the 4-byte CRC32.
+* **Mechanism:** When `wal.integrity.enabled=true`, the store transitions to Format v2:
+  * WAL begins with a 16-byte magic header (`WALKVS02` + version 2 + flags).
+  * Each record appends a 32-byte cryptographic tag computed via `HMAC-SHA-256(secret, DOMAIN || prevHmacTag || canonicalRecordBytes)`.
+  * The first record chains from an all-zero 32-byte **genesis tag**.
+  * Any record modification, deletion from the middle, or reordering breaks the chain downstream and halts startup recovery with `StorageException` without truncating.
+
 ---
 
 ## Quickstart: Running Locally
@@ -166,6 +174,28 @@ curl -X POST http://localhost:8080/keys/batch \
     "keysRetained": 1500
   }
   ```
+* **Inspect Integrity Status (Protected):** `GET /admin/integrity` (requires `X-Admin-Token` or `Authorization: Bearer <token>`)
+  ```bash
+  curl -H "X-Admin-Token: secret-admin-token" http://localhost:8080/admin/integrity
+  ```
+  *When integrity mode is enabled (`wal.integrity.enabled=true`):*
+  ```json
+  {
+    "status": "VALID",
+    "integrityEnabled": true,
+    "walFormatVersion": 2,
+    "verifiedEntries": 1820,
+    "lastSequenceNumber": 1819,
+    "chainRootPrefix": "a1b2c3d4e5f6"
+  }
+  ```
+  *When integrity mode is disabled (`wal.integrity.enabled=false`):*
+  ```json
+  {
+    "status": "DISABLED",
+    "integrityEnabled": false
+  }
+  ```
 
 ---
 
@@ -239,19 +269,42 @@ This mounts a persistent Docker volume at `/data/wal` so data survives container
 | `SERVER_PORT` | `8080` | HTTP listening port |
 | `WAL_FILE` | `/data/wal/store.wal` | Path to the active `.wal` file |
 | `WAL_AUTO_COMPACT_THRESHOLD_BYTES` | `10485760` (10MB) | File size threshold for auto-compaction |
-| `KVSTORE_ADMIN_TOKEN` | `secret-admin-token` | Secret key required for `/admin/stats` and `/admin/compact` |
+| `KVSTORE_ADMIN_TOKEN` | `secret-admin-token` | Secret key required for admin endpoints |
+| `WAL_INTEGRITY_ENABLED` | `false` | Enable HMAC-SHA-256 tamper-evident integrity chain |
+| `WAL_INTEGRITY_SECRET` | *(empty)* | Shared secret key for cryptographic tag calculation |
+
+---
+
+## Threat Model & Migration Policy
+
+### Cryptographic Guarantees (What HMAC Chaining Detects)
+When `wal.integrity.enabled=true`, the engine cryptographically links every record to its predecessor via HMAC-SHA-256 tags verified with constant-time equality checks (`MessageDigest.isEqual`):
+* **Record Tampering:** Altering any byte of a payload or header produces an invalid HMAC tag and is rejected during startup recovery without truncating.
+* **Deletion from Middle:** Deleting any intermediate record breaks the chain for all subsequent records because the expected predecessor tag no longer matches.
+* **Reordering / Splicing:** Transposing records changes their input tags and breaks chain validation.
+
+### Honest Security Limitations
+* **Rollback & Suffix Truncation:** A hash chain alone cannot prevent an attacker with raw disk access from replacing the entire file with an older, previously valid snapshot of the same file, or truncating valid entries off the very end of the file, unless an expected head/root checkpoint is published and verified outside the WAL (e.g. in external durable storage or a ledger consensus service).
+* **Compaction Audit Semantics:** Compaction intentionally snapshots only the current active live keys into a clean new chain beginning at the genesis tag. It is designed for disk space reclamation, not for long-term immutable archival history.
+
+### Legacy WAL Migration Behavior
+If `wal.integrity.enabled=true` is enabled on an existing legacy (Format v1) WAL:
+* The store **deliberately refuses to start** with a clear `StorageException`.
+* **Why this is safer:** Automatically signing existing historical entries on startup would create a false sense of security — any tampering that occurred prior to enabling integrity mode would be retroactively certified as authentic. Users must start with a clean WAL or perform an explicit verified migration.
 
 ---
 
 ## Test Suite
 
-All 40 comprehensive unit and integration tests pass with zero warnings:
+All 50 comprehensive unit and integration tests pass with zero warnings:
 
 ```bash
 mvn test
 ```
 
-* `KeyValueControllerHttpIntegrationTest` (9 Spring MVC HTTP integration tests: routing, param binding, input validation, 400/401/404 handling)
+* `WalIntegrityTest` (9 tests: cryptographic HMAC chain verification, byte tampering detection, record deletion rejection, reordering detection, torn write recovery, compaction chain preservation, missing secret validation, secret non-disclosure)
+* `KeyValueControllerIntegrityHttpIntegrationTest` (Spring MVC integration test verifying `/admin/integrity` endpoint under active integrity mode)
+* `KeyValueControllerHttpIntegrationTest` (Spring MVC HTTP integration tests: routing, param binding, input validation, 400/401/404 handling)
 * `StorageEngineHardeningTest` (Exclusive file locking, dual-process conflict detection, dynamic health check verification)
 * `StorageEngineTest` (CRUD, persistence across reboots)
 * `CompactionTest` (Space reclamation, atomic file replacement, auto-compaction)

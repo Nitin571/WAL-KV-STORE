@@ -197,5 +197,17 @@ class KeyValueControllerHttpIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("compacted"))
                 .andExpect(jsonPath("$.keysRetained").isNumber());
+
+        // 7. Integrity endpoint without token should return 401 Unauthorized
+        mockMvc.perform(get("/admin/integrity"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error", containsString("Unauthorized")));
+
+        // 8. Integrity endpoint with valid token when disabled
+        mockMvc.perform(get("/admin/integrity")
+                        .header("X-Admin-Token", "secret-admin-token"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("DISABLED"))
+                .andExpect(jsonPath("$.integrityEnabled").value(false));
     }
 }
